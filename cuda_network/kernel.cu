@@ -23,8 +23,6 @@ There is a "layer calculating" parallelism tactic. Every whole layer calculated 
 Bitmaps map also calculated in multithread.
 */
 
-#define GROUP_SIZE 512 //count of neurons in net
-#define SUB_GROUP_SIZE 32 //size of layer (must be divisible with GROUP_SIZE)
 
 
 void SaveBitmapToFile( BYTE* pBitmapBits,  
@@ -85,149 +83,27 @@ void SaveBitmapToFile( BYTE* pBitmapBits,
     CloseHandle( hFile );  
 }  
 
+/////start program
 
+/*///////
+main idea to decompose structure in 1-dimensional array
+so the group is 
+i - number of neuron
+j - number of group
+SUB_GROUP_SIZE*j>i>SUB_GROUP_SIZE*(j+1)
+[i+0]activation
+[i+1]potential
+[i+2]threshold
+[i+3]...[i+SUB_GROUP_SIZE] - weights
+///////*/
 
+#define GROUP_SIZE 2048 //count of neurons in net
+#define SUB_GROUP_SIZE 256 //size of layer (must be divisible with GROUP_SIZE)
+#define SUB_GROUP_OFFSET 3 //activation //potential //threshold
 
-
-class neuron
-{
-public:
-    float in_weights[SUB_GROUP_SIZE];
-    float potential;
-    float threshold;
-	float value;
-    neuron();
-	bool checked;
-	void manualFire(float);
-	__device__ void update();
-	void mixWeights();
-};
-
-neuron::neuron()
-{
-    for (int i=0;i<SUB_GROUP_SIZE;i++)
-    {
-        in_weights[i]=0;
-    }
-    potential=0;
-	value=0;
-    //random threshold init
-    threshold=rand()%1000/1000.0f;
-	checked=false;
-}
-
-
-
-
-
-
-void neuron::mixWeights()
-{
-	int i=SUB_GROUP_SIZE;
-	while(i--)
-	{
-		this->in_weights[i]=rand()%1000/1000.0f;
-	}
-}
-
-
-
-void mixWeightsInGroup(neuron* group)
-{
-	for(int j=0;j<GROUP_SIZE;j++)
-    {
-		group[j].mixWeights();
-    }
-}
-
-__global__ void setInputs(neuron* group,float f[])
-{
-	int j = threadIdx.x;
-	if(j>=SUB_GROUP_SIZE) 
-		return;
-	group[j].potential=f[j];
-}
-
-__global__ void calcBitmap(neuron* group, BYTE buf[],BYTE bufFires[])
-{
-	int j = blockIdx.x*blockDim.x+threadIdx.x;
-	if (j >= GROUP_SIZE)return;
-	int c =j*3;
-	float f=group[j].potential/group[j].threshold;
-	if(f>1)f=1.0f;
-	unsigned int val =  
-              int(f*255 + 0.5);                           
-  
-        buf[ c + 0 ] = (BYTE) val;  
-        buf[ c + 1 ] = (BYTE) val;  
-        buf[ c + 2 ] = (BYTE) val; 
-		//show only fires
-		val =int(group[j].value*255 + 0.5);                           
-  
-        bufFires[ c + 0 ] = (BYTE) val;  
-        bufFires[ c + 1 ] = (BYTE) val;  
-        bufFires[ c + 2 ] = (BYTE) val;
-}
-
-
-
-
-__global__ void updateGroup(neuron* group,unsigned int layerId)
-{
-	int j = threadIdx.x+layerId*SUB_GROUP_SIZE;
-	//group[j].update();
-	if(group[j].value>0)
-	{
-	group[j].value=0.0f;
-	group[j].potential=0;
-	}
-	float dPotential=0;
-	if(layerId>0)
-	{
-		int offset=SUB_GROUP_SIZE*(layerId-1);
-		int w_offset=0;
-		for(int i=offset;i<(offset+SUB_GROUP_SIZE);i++)
-		{
-			dPotential=dPotential+group[i].value*group[j].in_weights[w_offset]/SUB_GROUP_SIZE; //must divede every input for keeping value between 0 and 1 
-			w_offset++;
-		}
-		group[j].potential=group[j].potential+dPotential;
-	}
-	if(group[j].potential>group[j].threshold)
-	{
-		group[j].value=1.0f;
-	}
-}
-
-void printNeuronsToBitmap(neuron* group,BYTE buf[])// for test
-{
-	int c=0;
-	for(int j=0;j<GROUP_SIZE;j++)
-    {
-		unsigned char val =  
-             0xBB;                         
-  
-        buf[ c + 0 ] = (BYTE) val;  
-        buf[ c + 1 ] = (BYTE) val;  
-        buf[ c + 2 ] = (BYTE) val;
-		c+=3;
-    }
-}
-
-//print to console
-void printNeurons(neuron* group,int from=0,int to=0)
-{
-	for(int j=from;j<to;j++)
-    {
-		printf("%d (%f) %f %f %d = ",j,group[j].value,group[j].potential,group[j].threshold,group[j].checked);
-		/*for(int k=0;k<SUB_GROUP_SIZE;k++)
-		{
-			printf("%d (%f): ",k,group[j].in_weights[k]);
-		}*/
-		printf("\n");
-    }
-}
-
+//prepere memory
+float host_group[GROUP_SIZE*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)];
+const int FULL_STRUCT_SIZE=GROUP_SIZE*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET);
 
 
 //for timing
@@ -249,11 +125,130 @@ class timer {
 		}
 };
 
-neuron* createGroup()
+
+
+void setWeightsAndThresholds(float* group)
 {
-	neuron* group;
-    group = new neuron[GROUP_SIZE];
-	return group;
+	for(int j=0;j<GROUP_SIZE;j++)
+    {
+		group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)+2]=rand()%1000/1000.0f;
+		for(int i=0;i<SUB_GROUP_SIZE;i++)
+		{
+		group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)+i+SUB_GROUP_OFFSET]=rand()%1000/1000.0f;
+		}
+    }
+}
+
+
+void printGroup(float* group)
+{
+	for(int j=0;j<GROUP_SIZE;j++)
+    {
+		float *groupPtr=&group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)];
+		printf(" a:%0.1f |",*groupPtr);
+		printf(" p:%0.3f |",*(groupPtr+1));
+		printf(" t:%0.3f |",*(groupPtr+2));
+		for(int i=0;i<SUB_GROUP_SIZE;i++)
+		{
+		printf(" %0.3f |",*(groupPtr+i+SUB_GROUP_OFFSET));
+		}
+		printf("\n");
+    }
+}
+
+__global__ void setInputs(float* group,float* f)
+{
+	int j = blockIdx.x*blockDim.x+threadIdx.x;
+	if(j>=SUB_GROUP_SIZE) 
+		return;
+	group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)+1]=f[j];
+	__syncthreads(); //must synchronize here because next call is kernel function and theoretically this function may not be finished before next function calling
+}
+
+__shared__ float prevResult[SUB_GROUP_SIZE];//array for saving previous group activations
+
+__global__ void updateGroup(float* group,unsigned int layerId)
+{
+	int p = blockIdx.x*blockDim.x+threadIdx.x;
+	if(p>=SUB_GROUP_SIZE) 
+		return;
+	int j=p+layerId*SUB_GROUP_SIZE; //set group offset
+	float *firstGPtr=&group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)];
+	float *PotentialPtr=&group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)+1];
+	float *ThresholdGPtr=&group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)+2];
+	if(*firstGPtr>0)
+	{
+	*firstGPtr=0.0f;
+	*PotentialPtr=0;
+	}
+	float dPotential=0;
+	if(layerId>0)
+	{
+		int w_offset=0;
+		for(int i=0;i<SUB_GROUP_SIZE;i++)
+		{
+			dPotential=dPotential +
+				prevResult[i] * (*(firstGPtr+SUB_GROUP_OFFSET+w_offset)) / SUB_GROUP_SIZE; //must divede every input for keeping value between 0 and 1 
+			w_offset++;
+		}
+		*PotentialPtr+=dPotential;
+	}
+	if(*PotentialPtr>*ThresholdGPtr)
+	{
+		*firstGPtr=1.0f;
+	}
+	prevResult[p]=*firstGPtr;
+}
+
+
+__global__ void calcBitmap(float* group, BYTE buf[],BYTE bufFires[])
+{
+	int j = blockIdx.x*blockDim.x+threadIdx.x;
+	if (j >= GROUP_SIZE)return;
+	float *firstGPtr=&group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)];
+	float *PotentialPtr=&group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)+1];
+	float *ThresholdGPtr=&group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)+2];
+	int c =j*3;
+	float f=*PotentialPtr / *ThresholdGPtr;
+	if(f>1)f=1.0f;
+	unsigned int val =  
+              int(f*255 + 0.5);                           
+  
+        buf[ c + 0 ] = (BYTE) val;  
+        buf[ c + 1 ] = (BYTE) val;  
+        buf[ c + 2 ] = (BYTE) val; 
+		//show fires only
+		val =int(*firstGPtr*255 + 0.5);                           
+  
+        bufFires[ c + 0 ] = (BYTE) val;  
+        bufFires[ c + 1 ] = (BYTE) val;  
+        bufFires[ c + 2 ] = (BYTE) val;
+}
+
+void calcBitmapTest(float group[], BYTE buf[],BYTE bufFires[])
+{
+	for(int j=0;j<GROUP_SIZE;j++)
+	{
+		if (j >= GROUP_SIZE)return;
+		float *firstGPtr=&group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)];
+		float *PotentialPtr=&group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)+1];
+		float *ThresholdGPtr=&group[j*(SUB_GROUP_SIZE+SUB_GROUP_OFFSET)+2];
+		int c =j*3;
+		float f=*PotentialPtr / *ThresholdGPtr;
+		if(f>1)f=1.0f;
+		unsigned int val =  
+				  int(f*255 + 0.5);                           
+  
+			buf[ c + 0 ] = (BYTE) val;  
+			buf[ c + 1 ] = (BYTE) val;  
+			buf[ c + 2 ] = (BYTE) val; 
+			//show only fires
+			val =int(*firstGPtr*255 + 0.5);                           
+  
+			bufFires[ c + 0 ] = (BYTE) val;  
+			bufFires[ c + 1 ] = (BYTE) val;  
+			bufFires[ c + 2 ] = (BYTE) val;
+	}
 }
 
 __host__ int main(int argc, char** argv) {
@@ -265,21 +260,20 @@ __host__ int main(int argc, char** argv) {
   stime = (unsigned) ltime/2;
   srand(stime);
 
-    //init group
-   neuron* host_group1;
-   neuron* dev_group_ptr;
-
-   host_group1 = createGroup();
-   mixWeightsInGroup(host_group1);
-   //printNeurons(host_group1,0,GROUP_SIZE);
-
+    
    printf("Program started...\n");
 
-	CUDA_CHECK(cudaMalloc((void**)&dev_group_ptr, GROUP_SIZE*sizeof(neuron)));
-	CUDA_CHECK(cudaMemcpy(dev_group_ptr, host_group1 , GROUP_SIZE*sizeof(neuron), cudaMemcpyHostToDevice));
+    //init group
+    setWeightsAndThresholds(host_group);
+	//printGroup(host_group);
+    float* dev_group_ptr;
+
+	CUDA_CHECK(cudaMalloc((void**)&dev_group_ptr, FULL_STRUCT_SIZE*sizeof(float)));
+	CUDA_CHECK(cudaMemcpy(dev_group_ptr, host_group , FULL_STRUCT_SIZE*sizeof(float), cudaMemcpyHostToDevice));
 	
 	//for bitmap
 	BYTE* buf = new BYTE[ GROUP_SIZE * 3];  
+	BYTE* fbuf = new BYTE[ GROUP_SIZE * 3];  //test
 	BYTE* pBuf;
 	BYTE* pBufFires;
 	CUDA_CHECK(cudaMalloc((void**)&pBuf, GROUP_SIZE*3*sizeof(BYTE)));
@@ -315,22 +309,21 @@ __host__ int main(int argc, char** argv) {
 			setInputs<<<1, SUB_GROUP_SIZE>>>(dev_group_ptr,dev_ptr_float); //insert new inputs
 			for(unsigned int groupId=0;groupId<GROUP_SIZE/SUB_GROUP_SIZE;groupId++)
 			{
-				updateGroup<<<1, SUB_GROUP_SIZE>>>(dev_group_ptr,groupId);//for sub_group_size < 512 looks better to use one grid with many threads
-				CUDA_CHECK(cudaEventRecord(syncEvent, 0));  
-				CUDA_CHECK(cudaEventSynchronize(syncEvent));   //wait until threads finish updates layer
+				updateGroup<<<1, SUB_GROUP_SIZE,0>>>(dev_group_ptr,groupId);//for sub_group_size < 512 looks better to use one grid with many threads
+				//this calls completely synchronous because they fire in the same stream so no need to call __syncthreads()
 			}
-			CUDA_CHECK(cudaMemcpy( host_group1, dev_group_ptr, GROUP_SIZE*sizeof(neuron), cudaMemcpyDeviceToHost )); 
 
+			CUDA_CHECK(cudaMemcpy( host_group, dev_group_ptr, FULL_STRUCT_SIZE*sizeof(float), cudaMemcpyDeviceToHost )); 
+			//printGroup(host_group);
 			//print to console
 			//system("cls");
-			//printNeurons(host_group1,0,GROUP_SIZE);
 
 			calcBitmap<<<gridSize, SUB_GROUP_SIZE>>>(dev_group_ptr,pBuf,pBufFires); 
 			CUDA_CHECK(cudaEventRecord(syncEvent, 0));  
 			CUDA_CHECK(cudaEventSynchronize(syncEvent));
 
 			CUDA_CHECK(cudaMemcpy( buf, pBuf, GROUP_SIZE*3*sizeof(BYTE), cudaMemcpyDeviceToHost )); 
-
+			 
 			SaveBitmapToFile( (BYTE*) buf,  
                             SUB_GROUP_SIZE,  
                             GROUP_SIZE/SUB_GROUP_SIZE,  
@@ -364,7 +357,6 @@ __host__ int main(int argc, char** argv) {
 
 	cudaEventDestroy(syncEvent);
 
-	delete[] host_group1;
 	delete [] buf; 
 	printf("Program successfuly stopped.\n");
     return 0;
